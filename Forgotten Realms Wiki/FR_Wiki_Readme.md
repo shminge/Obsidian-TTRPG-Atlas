@@ -246,6 +246,9 @@ perhaps in all [[Faerûn]]...
 **"No such file or directory" error**
 → Check your file paths. On Windows, make sure you're using quote marks around paths that contain spaces: `"D:\My Files\example.xml"`
 
+**"PermissionError: [Errno 13] Permission denied" error (Linux/Mac)**
+→ The XML file was extracted with no read permissions. Fix it by running: `chmod 644 /path/to/forgottenrealms_pages_current.xml`
+
 **The script seems frozen / no output**
 → It's working — the first two passes have no progress bar. Wait a few minutes. If you installed `tqdm`, you'll see a progress bar during the third pass.
 
