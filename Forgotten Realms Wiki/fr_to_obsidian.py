@@ -16,6 +16,7 @@ Requirements:
 """
 
 import re
+import json
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -330,6 +331,19 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     return wikitext.strip()
 
 
+def sanitize_link_target(page: str) -> str:
+    """
+    Sanitize a page name to match the filename on disk.
+    Replaces characters invalid in filenames (/ : * ? etc) with hyphens,
+    matching sanitize_filename() used when writing notes.
+    Critical for links like [[Waterdeep/Dock Ward]] which must become
+    [[Waterdeep-Dock Ward]] to match the file Waterdeep-Dock Ward.md.
+    """
+    safe = re.sub(r'[\\/:*?"<>|]', '-', page)
+    safe = re.sub(r'-+', '-', safe).strip(' -.')
+    return safe[:200]
+
+
 def resolve_wikilinks(text: str, redirect_map: dict) -> str:
     """Resolve redirect links and normalise wikilinks."""
 
@@ -344,21 +358,27 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
             display = None
 
         norm = normalise_title(page_part)
+        # Clean underscores/anchors for display text
         clean_page = page_part.replace('_', ' ').split('#')[0].strip()
+        # Sanitize to match actual filename (/ -> -, etc.)
+        safe_page = sanitize_link_target(clean_page)
         target = redirect_map.get(norm)
 
         if target:
+            # Redirect resolved — sanitize the target to match its filename
+            safe_target = sanitize_link_target(target)
             if display:
-                return f'[[{target}|{display}]]'
+                return f'[[{safe_target}|{display}]]'
             elif clean_page.lower() != target.lower():
-                return f'[[{target}|{clean_page}]]'
+                return f'[[{safe_target}|{clean_page}]]'
             else:
-                return f'[[{target}]]'
+                return f'[[{safe_target}]]'
         else:
+            # No redirect — use sanitized page name so link matches file on disk
             if display:
-                return f'[[{clean_page}|{display}]]'
-            elif clean_page != page_part:
-                return f'[[{clean_page}]]'
+                return f'[[{safe_page}|{display}]]'
+            elif safe_page != page_part:
+                return f'[[{safe_page}]]'
             else:
                 return m.group(0)
 
@@ -628,20 +648,159 @@ def iter_articles(xml_path: Path):
 # Main
 # ---------------------------------------------------------------------------
 
-def process(xml_path: Path, output_dir: Path):
+def load_map_seeds(json_path: Path) -> set:
+    """Extract pin link names from an Obsidian map markers JSON file."""
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    seeds = set()
+    for marker in data.get('markers', []):
+        if marker.get('type') == 'pin' and marker.get('link'):
+            seeds.add(marker['link'].strip())
+    print(f"  Loaded {len(seeds)} map pins from {json_path.name}")
+    return seeds
+
+
+def build_article_allowlist(xml_path: Path, seeds: set,
+                             redirect_map: dict) -> set:
+    """
+    Build the set of article titles to include using graph traversal.
+
+    Strategy:
+    - Start with the map pin names as seeds
+    - Follow ALL wikilinks from place articles (Location/Building/Road infoboxes)
+    - From non-place articles, do NOT follow further links (they act as leaf nodes)
+    - This keeps the vault geographically focused while including directly
+      referenced characters, deities, organisations etc.
+    """
+    print("Building article allowlist from map pins...")
+
+    ns = detect_xml_namespace(xml_path)
+
+    # Build full index: normalised_title -> (canonical_title, wikitext, is_place)
+    print("  Indexing all articles...")
+    index = {}       # norm -> (canonical, wikitext, is_place)
+    redir = {}       # norm -> norm target
+
+    PLACE_IBOX_SET = PLACE_INFOBOX_NAMES  # reuse existing set
+
+    context = ET.iterparse(xml_path, events=('end',))
+    for event, elem in context:
+        if elem.tag == f'{ns}page':
+            title_el = elem.find(f'{ns}title')
+            text_el  = elem.find(f'.//{ns}text')
+            if title_el is not None and text_el is not None:
+                title = (title_el.text or '').strip()
+                text  = (text_el.text  or '').strip()
+                norm  = normalise_title(title)
+
+                # Skip meta namespaces
+                if any(title.startswith(p) for p in SKIP_PREFIXES):
+                    elem.clear()
+                    continue
+
+                if text.lower().startswith('#redirect'):
+                    m = re.search(r'#redirect[^\[]*\[\[([^\]#|]+)', text, re.IGNORECASE)
+                    if m:
+                        redir[norm] = normalise_title(m.group(1))
+                elif text:
+                    # Detect if this is a place article
+                    ibox_pat = r'\{\{(' + '|'.join(
+                        re.escape(n) for n in PLACE_IBOX_SET
+                    ) + r')\s*[\n\r|]'
+                    is_place = bool(re.search(ibox_pat, text, re.IGNORECASE))
+                    index[norm] = (title, text, is_place)
+            elem.clear()
+
+    print(f"  Indexed {len(index):,} articles, {len(redir):,} redirects")
+
+    def resolve_norm(name: str) -> str:
+        norm = normalise_title(name)
+        visited = {norm}
+        for _ in range(10):
+            if norm in redir:
+                nxt = redir[norm]
+                if nxt in visited:
+                    break
+                visited.add(nxt)
+                norm = nxt
+            else:
+                break
+        return norm
+
+    def get_links(text: str) -> set:
+        links = set()
+        for m in re.finditer(r'\[\[([^\]|#]+)', text):
+            links.add(m.group(1).strip())
+        return links
+
+    # Seed the queue with map pins
+    queue = []
+    for seed in seeds:
+        norm = resolve_norm(seed)
+        if norm in index:
+            queue.append(norm)
+
+    print(f"  {len(queue)} of {len(seeds)} pins matched articles in XML")
+
+    # BFS: follow links from place articles only
+    allowlist = set()
+    to_visit = list(queue)
+
+    while to_visit:
+        norm = to_visit.pop()
+        if norm in allowlist:
+            continue
+        if norm not in index:
+            continue
+        allowlist.add(norm)
+        canonical, text, is_place = index[norm]
+
+        # Only follow outgoing links from place articles
+        if is_place:
+            for link in get_links(text):
+                target = resolve_norm(link)
+                if target not in allowlist and target in index:
+                    to_visit.append(target)
+
+    print(f"  Allowlist: {len(allowlist):,} articles to extract\n")
+    return allowlist, index
+
+
+def process(xml_path: Path, output_dir: Path, json_path: Path = None):
     print(f"Input:  {xml_path}")
     print(f"Output: {output_dir}\n")
 
     redirect_map = build_redirect_map(xml_path)
 
-    print("Counting articles (pass 2)...")
-    total = sum(1 for _ in iter_articles(xml_path))
-    print(f"Found {total:,} articles.\n")
+    # If a JSON map file was provided, build the allowlist
+    allowlist = None
+    article_index = None
+    if json_path:
+        seeds = load_map_seeds(json_path)
+        allowlist, article_index = build_article_allowlist(xml_path, seeds, redirect_map)
+
+    if allowlist is None:
+        print("Counting articles (pass 2)...")
+        total = sum(1 for _ in iter_articles(xml_path))
+        print(f"Found {total:,} articles.\n")
+    else:
+        total = len(allowlist)
+        print(f"Processing {total:,} articles from allowlist.\n")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = {'written': 0, 'skipped': 0, 'links_resolved': 0}
 
-    iterator = iter_articles(xml_path)
+    # Use allowlist-based iterator or full iterator
+    if allowlist is not None and article_index is not None:
+        def iter_allowed():
+            for norm, (canonical, wikitext, _) in article_index.items():
+                if norm in allowlist:
+                    yield canonical, wikitext
+        base_iterator = iter_allowed()
+    else:
+        base_iterator = iter_articles(xml_path)
+
+    iterator = base_iterator
     if HAS_TQDM:
         iterator = tqdm(iterator, total=total, unit='articles')
 
@@ -715,6 +874,55 @@ def process(xml_path: Path, output_dir: Path):
             else:
                 print(msg)
 
+    # Post-process: convert broken links to plain text
+    fix_broken_links(output_dir)
+
+    return stats
+
+
+def fix_broken_links(output_dir: Path) -> dict:
+    """
+    Post-processing pass: scan all notes for [[wikilinks]] that point to
+    notes that don't exist in the vault, and convert them to plain text.
+
+    [[Missing Page]]          -> Missing Page
+    [[Missing Page|Display]]  -> Display
+    [[Existing Page]]         -> [[Existing Page]]  (unchanged)
+    """
+    print("\nFixing broken links...")
+
+    # Single pass: collect all files, build index, then fix
+    all_files = list(output_dir.rglob('*.md'))
+    existing = {md.stem.lower() for md in all_files}
+    print(f"  Scanning {len(all_files):,} notes...")
+
+    link_pattern = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+    stats = {'notes_fixed': 0, 'links_fixed': 0}
+
+    for md in all_files:
+        original = md.read_text(encoding='utf-8')
+        fixed = original
+        changed = False
+
+        def replace_link(m):
+            page    = m.group(1).strip()
+            display = m.group(2).strip() if m.group(2) else None
+            # Use sanitize_link_target so [[Waterdeep/Dock Ward]] -> 'waterdeep-dock ward'
+            safe = sanitize_link_target(page)
+            if safe.lower() in existing:
+                return m.group(0)  # link is valid — leave it alone
+            # Broken link — return plain text
+            return display if display else page
+
+        new_content = link_pattern.sub(replace_link, fixed)
+        if new_content != original:
+            md.write_text(new_content, encoding='utf-8')
+            stats['notes_fixed'] += 1
+            # Count how many links were fixed in this note
+            stats['links_fixed'] += len(link_pattern.findall(original)) - len(link_pattern.findall(new_content))
+
+    print(f"  Fixed {stats['links_fixed']:,} broken links across {stats['notes_fixed']:,} notes")
+
     return stats
 
 
@@ -745,6 +953,10 @@ def main():
                         help='Path to forgottenrealms_pages_current.xml')
     parser.add_argument('--output', '-o', default='./FR-Vault',
                         help='Output directory (default: ./FR-Vault)')
+    parser.add_argument('--json', '-j', default=None,
+                        help='Path to Obsidian map markers JSON file. '
+                             'If provided, only extracts articles linked '
+                             'from map pins and the places they link to.')
     args = parser.parse_args()
 
     xml_path   = Path(args.input)
@@ -754,7 +966,12 @@ def main():
         print(f"ERROR: Input file not found: {xml_path}")
         return
 
-    stats = process(xml_path, output_dir)
+    json_path = Path(args.json) if args.json else None
+    if json_path and not json_path.exists():
+        print(f"ERROR: JSON file not found: {json_path}")
+        return
+
+    stats = process(xml_path, output_dir, json_path)
     print_summary(output_dir, stats)
 
 
