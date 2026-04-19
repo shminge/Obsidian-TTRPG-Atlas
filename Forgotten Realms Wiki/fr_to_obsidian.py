@@ -17,6 +17,8 @@ Requirements:
 
 import re
 import json
+import hashlib
+import html
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -130,7 +132,10 @@ CATEGORY_RULES = [
 ]
 
 FALLBACK_FOLDER = 'Miscellaneous'
-BASE_URL = 'https://forgottenrealms.fandom.com/wiki/'
+BASE_URL  = 'https://forgottenrealms.fandom.com/wiki/'
+# Fandom CDN identifier used to build image URLs — change if adapting for
+# a different MediaWiki/Fandom site.
+WIKI_ID   = 'forgottenrealms'
 
 
 # ---------------------------------------------------------------------------
@@ -251,20 +256,247 @@ def normalise_title(title: str) -> str:
     return title.strip().lower()
 
 
+def mediawiki_image_url(filename: str) -> str:
+    """Return the Fandom/Wikia CDN URL for a MediaWiki image file.
+
+    MediaWiki stores images at:
+      .../images/{a}/{ab}/{Normalized_filename}
+    where {a} and {ab} are the first 1 and 2 hex chars of the MD5 hash
+    of the normalised filename (spaces → underscores, first char upper-cased).
+    """
+    name = filename.strip().replace(' ', '_')
+    if name:
+        name = name[0].upper() + name[1:]
+    digest = hashlib.md5(name.encode('utf-8')).hexdigest()
+    a, ab = digest[0], digest[:2]
+    return f'https://static.wikia.nocookie.net/{WIKI_ID}/images/{a}/{ab}/{name}'
+
+
+# Wikitext image parameters that are not captions
+_IMAGE_PARAM_RE = re.compile(
+    r'^(thumb|thumbnail|frame|frameless|border|left|right|center|none'
+    r'|\d+px|upright[\d.=]*)$',
+    re.IGNORECASE,
+)
+
+
+def _clean_image_caption(raw: str) -> str:
+    """Strip wikilinks and wiki markup from a raw image caption string."""
+    raw = re.sub(r'\[\[[^\]]*\|([^\]]*)\]\]', r'\1', raw)   # [[Page|Display]] → Display
+    raw = re.sub(r'\[\[([^\]]*)\]\]', r'\1', raw)            # [[Page]] → Page
+    raw = re.sub(r"'{2,5}", '', raw)                          # bold/italic markers
+    return raw.strip()
+
+
+def _process_inline_images(wikitext: str) -> str:
+    """Replace [[File:…]] / [[Image:…]] wikilinks with Markdown ![caption](url).
+
+    Uses bracket-depth counting so captions that themselves contain [[wikilinks]]
+    are handled correctly.
+    """
+    file_start = re.compile(r'\[\[(?:File|Image|Media):', re.IGNORECASE)
+    out = []
+    i = 0
+    while i < len(wikitext):
+        m = file_start.search(wikitext, i)
+        if not m:
+            out.append(wikitext[i:])
+            break
+        out.append(wikitext[i:m.start()])
+
+        # Walk forward with depth counting to find the matching ]]
+        depth = 0
+        j = m.start()
+        while j < len(wikitext):
+            if wikitext[j:j+2] == '[[':
+                depth += 1
+                j += 2
+            elif wikitext[j:j+2] == ']]':
+                depth -= 1
+                if depth == 0:
+                    j += 2
+                    break
+                j += 2
+            else:
+                j += 1
+
+        full_link = wikitext[m.start():j]       # e.g. [[File:Foo.png|thumb|Caption]]
+        inner     = full_link[2:-2]              # strip outer [[ ]]
+        parts     = inner.split('|')
+        raw_name  = parts[0].split(':', 1)[-1].strip()
+
+        # Last non-parameter part becomes the caption
+        caption = ''
+        for part in parts[1:]:
+            part = part.strip()
+            if not _IMAGE_PARAM_RE.match(part) and part:
+                caption = part                   # keep overwriting — last one wins
+
+        caption = _clean_image_caption(caption)
+        url = mediawiki_image_url(raw_name)
+        out.append(f'![{caption}]({url})')
+        i = j
+
+    return ''.join(out)
+
+
+def _process_gallery_block(gallery_body: str) -> str:
+    """Convert the inner content of a <gallery> block into Markdown image lines.
+
+    Returns a Markdown string (with a ## Gallery heading), or '' if empty.
+    """
+    images = []
+    for line in gallery_body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if '|' in line:
+            raw_name, raw_caption = line.split('|', 1)
+        else:
+            raw_name, raw_caption = line, ''
+        raw_name = raw_name.strip()
+        if not raw_name:
+            continue
+        caption = _clean_image_caption(raw_caption)
+        url = mediawiki_image_url(raw_name)
+        images.append(f'![{caption}]({url})')
+
+    if not images:
+        return ''
+    return '## Gallery\n\n' + '\n\n'.join(images)
+
+
+def _convert_quote_templates(wikitext: str) -> str:
+    """Replace {{quote|text|attribution}} with a Markdown blockquote.
+
+    Uses brace-depth counting so quote bodies containing nested templates
+    are handled correctly. Format produced:
+        > Text of the quote.
+        >
+        > — Attribution
+    """
+    quote_start = re.compile(r'\{\{[Qq]uote\s*\|')
+    out = []
+    i = 0
+    while i < len(wikitext):
+        m = quote_start.search(wikitext, i)
+        if not m:
+            out.append(wikitext[i:])
+            break
+        out.append(wikitext[i:m.start()])
+
+        # Walk from the opening {{ with depth counting to find matching }}
+        depth = 0
+        j = m.start()
+        while j < len(wikitext):
+            if wikitext[j:j+2] == '{{':
+                depth += 1
+                j += 2
+            elif wikitext[j:j+2] == '}}':
+                depth -= 1
+                if depth == 0:
+                    j += 2
+                    break
+                j += 2
+            else:
+                j += 1
+
+        full  = wikitext[m.start():j]   # full {{quote|...|...}} block
+        inner = full[2:-2]              # strip outer {{ }}
+
+        # Split on '|' at depth-0 (not inside nested {{ }})
+        parts = []
+        cur   = []
+        d     = 0
+        start_idx = inner.index('|') + 1   # skip 'quote|' prefix
+        for ch_i in range(start_idx, len(inner)):
+            ch = inner[ch_i]
+            if inner[ch_i:ch_i+2] == '{{':
+                d += 1
+                cur.append(ch)
+            elif inner[ch_i:ch_i+2] == '}}':
+                d -= 1
+                cur.append(ch)
+            elif ch == '|' and d == 0:
+                parts.append(''.join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append(''.join(cur).strip())
+
+        body        = parts[0] if parts else ''
+        attribution = parts[1] if len(parts) > 1 else ''
+
+        # Strip nested templates from body and attribution
+        for _ in range(4):
+            body        = re.sub(r'\{\{[^{}]*\}\}', '', body)
+            attribution = re.sub(r'\{\{[^{}]*\}\}', '', attribution)
+        body        = body.strip()
+        attribution = attribution.strip()
+
+        if body:
+            bq_lines = '\n'.join(f'> {ln}' if ln.strip() else '>' for ln in body.splitlines())
+            if attribution:
+                out.append(f'{bq_lines}\n>\n> — {attribution}\n')
+            else:
+                out.append(f'{bq_lines}\n')
+        # Empty body → drop the template entirely
+
+        i = j
+
+    return ''.join(out)
+
+
 def convert_wikitext_to_markdown(wikitext: str) -> str:
     """Convert wikitext markup to Markdown, preserving [[wikilinks]]."""
 
-    # Remove <ref> tags
-    wikitext = re.sub(r'<ref[^>]*>.*?</ref>', '', wikitext, flags=re.DOTALL)
-    wikitext = re.sub(r'<ref[^/]*/>', '', wikitext)
+    # ── Ref stripping — ORDER IS CRITICAL ───────────────────────────────────
+    # Self-closing refs MUST go first. The paired-ref regex <ref[^>]*>.*?</ref>
+    # matches the ">" in "<ref name="x" />" as the opening tag's close, then
+    # DOTALL-scans to the next </ref> — consuming everything between, including
+    # section headings like ==Aims & Goals==.
+    wikitext = re.sub(r'<ref\b[^>]*/>', '', wikitext)                           # <ref name="x" /> or <ref/>
+    wikitext = re.sub(r'<ref\b[^>]*>.*?</ref>', '', wikitext, flags=re.DOTALL)  # <ref>...</ref>
 
     # Remove HTML comments
     wikitext = re.sub(r'<!--.*?-->', '', wikitext, flags=re.DOTALL)
 
-    # Save [[wikilinks]] so template removal doesn't eat them
-    links = []
+    # Expand ordinal-suffix templates before general removal: {{th}} → th etc.
+    wikitext = re.sub(r'\{\{(th|st|nd|rd)\}\}', r'\1', wikitext, flags=re.IGNORECASE)
 
-    def save_link(m):
+    # Convert {{quote|text|attribution}} to blockquotes BEFORE general template
+    # removal — the content would otherwise be silently dropped.
+    wikitext = _convert_quote_templates(wikitext)
+
+    # ── Images ──────────────────────────────────────────────────────────────
+    # Inline [[File:…]] → ![caption](cdn_url). Runs BEFORE save_link so that
+    # depth-counting correctly handles captions containing [[wikilinks]].
+    wikitext = _process_inline_images(wikitext)
+
+    # <gallery> blocks → collect as a ## Gallery section appended at the end.
+    # Runs BEFORE the trailing-sections strip so images aren't lost when the
+    # ===Gallery=== heading is removed.
+    gallery_sections: list[str] = []
+
+    def _collect_gallery(m: re.Match) -> str:
+        md = _process_gallery_block(m.group(1))
+        if md:
+            gallery_sections.append(md)
+        return ''
+
+    wikitext = re.sub(
+        r'<gallery[^>]*>(.*?)</gallery>',
+        _collect_gallery,
+        wikitext,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Save [[wikilinks]] so template removal doesn't eat them
+    links: list[str] = []
+
+    def save_link(m: re.Match) -> str:
         links.append(m.group(0))
         return f'\x00LINK{len(links)-1}\x00'
 
@@ -276,38 +508,37 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     wikitext = re.sub(r'\{\{|\}\}', '', wikitext)
 
     # Restore wikilinks
-    for i, link in enumerate(links):
-        wikitext = wikitext.replace(f'\x00LINK{i}\x00', link)
+    for idx, lnk in enumerate(links):
+        wikitext = wikitext.replace(f'\x00LINK{idx}\x00', lnk)
 
-    # Remove File/Image/Category/language links
-    wikitext = re.sub(r'\[\[(?:File|Image|Media):[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+    # Category links: [[Category:X]] → remove; [[:Category:X|display]] → display text
     wikitext = re.sub(r'\[\[Category:[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+    wikitext = re.sub(r'\[\[:Category:(?:[^|\]]*)\|([^\]]*)\]\]', r'\1', wikitext, flags=re.IGNORECASE)
+    wikitext = re.sub(r'\[\[:Category:[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+
+    # Interlanguage links (e.g. [[fr:Zhentarim]])
     wikitext = re.sub(r'\[\[[a-z]{2,3}:[^\]]*\]\]', '', wikitext)
 
     # External links: keep display text
     wikitext = re.sub(r'\[https?://[^\s\]]+\s+([^\]]+)\]', r'\1', wikitext)
     wikitext = re.sub(r'\[https?://[^\]]+\]', '', wikitext)
 
-    # Remove trailing sections
+    # Remove trailing sections. Gallery is in this list — the raw ===Gallery===
+    # section is stripped here while the converted images are re-appended below.
     wikitext = re.sub(
         r'^(==+)\s*(References|See also|External links|Gallery|Appendix|Notes|Further reading|Appearances)\s*\1.*',
-        '', wikitext, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE
+        '', wikitext, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
 
-    # Headings
-    for lvl in range(6, 1, -1):
-        eq = '=' * lvl
-        md_hashes = '#' * (lvl - 1)
-        wikitext = re.sub(
-            rf'^{eq}\s*(.+?)\s*{eq}\s*$',
-            rf'{md_hashes} \1',
-            wikitext,
-            flags=re.MULTILINE
-        )
+    # Strip any remaining HTML tags
+    wikitext = re.sub(r'<[^>]+>', '', wikitext)
 
-    # Bold and italic (using character repetition to avoid quote issues)
-    wikitext = re.sub(r"'{3}(.+?)'{3}", r'**\1**', wikitext)
-    wikitext = re.sub(r"'{2}(.+?)'{2}", r'*\1*',   wikitext)
+    # ── Markup conversion — ORDER MATTERS ───────────────────────────────────
+    # Lists → Headings → Bold/Italic
+    # (a) Convert wikitext # list markers BEFORE headings so the freshly-created
+    #     "## Heading" isn't re-matched as a numbered list item.
+    # (b) Convert bold/italic AFTER lists so a leading * in ''italic'' at
+    #     line-start isn't consumed by the bullet-list regex.
 
     # Lists
     wikitext = re.sub(r'^\*\*\*\s*', '      - ', wikitext, flags=re.MULTILINE)
@@ -321,14 +552,37 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     wikitext = re.sub(r'^;\s*(.+)', r'**\1**', wikitext, flags=re.MULTILINE)
     wikitext = re.sub(r'^:\s*',     '> ',      wikitext, flags=re.MULTILINE)
 
-    # Gallery blocks and remaining HTML
-    wikitext = re.sub(r'<gallery[^>]*>.*?</gallery>', '', wikitext, flags=re.DOTALL | re.IGNORECASE)
-    wikitext = re.sub(r'<[^>]+>', '', wikitext)
+    # Headings: ==H2== → ##, ===H3=== → ###, etc.
+    # Page title is already # H1, so body sections start at ##.
+    # Process deepest first so ====X==== isn't partially matched by ==.
+    for lvl in range(6, 1, -1):
+        eq        = '=' * lvl
+        md_hashes = '#' * lvl          # note: lvl not lvl-1 (was off-by-one in original)
+        wikitext  = re.sub(
+            rf'^{eq}\s*(.+?)\s*{eq}\s*$',
+            rf'{md_hashes} \1',
+            wikitext,
+            flags=re.MULTILINE,
+        )
 
-    # Clean up blank lines
+    # Bold+italic, bold, italic — after lists
+    wikitext = re.sub(r"'{5}(.+?)'{5}", r'***\1***', wikitext)
+    wikitext = re.sub(r"'{3}(.+?)'{3}", r'**\1**',   wikitext)
+    wikitext = re.sub(r"'{2}(.+?)'{2}", r'*\1*',     wikitext)
+
+    # Unescape HTML entities (&amp; → &, &nbsp; → space, etc.)
+    wikitext = html.unescape(wikitext)
+
+    # Clean up excess blank lines
     wikitext = re.sub(r'\n{3,}', '\n\n', wikitext)
 
-    return wikitext.strip()
+    body = wikitext.strip()
+
+    # Append gallery images collected above
+    if gallery_sections:
+        body = body.rstrip('\n') + '\n\n' + '\n\n'.join(gallery_sections)
+
+    return body
 
 
 def sanitize_link_target(page: str) -> str:
@@ -365,7 +619,10 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
         target = redirect_map.get(norm)
 
         if target:
-            # Redirect resolved — sanitize the target to match its filename
+            # If the redirect resolves to a Category page, emit plain text —
+            # [[Category:...]] wikilinks are invalid in Obsidian note bodies.
+            if re.match(r':?Category:', target, re.IGNORECASE):
+                return display or clean_page
             safe_target = sanitize_link_target(target)
             if display:
                 return f'[[{safe_target}|{display}]]'
@@ -374,7 +631,9 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
             else:
                 return f'[[{safe_target}]]'
         else:
-            # No redirect — use sanitized page name so link matches file on disk
+            # If the page itself is a :Category: link, emit plain text
+            if re.match(r':?Category:', clean_page, re.IGNORECASE):
+                return display or clean_page
             if display:
                 return f'[[{safe_page}|{display}]]'
             elif safe_page != page_part:
